@@ -7,6 +7,9 @@
 #             the belt is still sorted, then back to IDLE ("Complete")
 # Safe Shutdown (GPIO17) is handled by the kernel overlay; SIGTERM cleans up here.
 #
+# If the model file is missing or fails to load, the script runs without detection:
+# the conveyor, buttons and LCD still work; no kicks are fired.
+#
 # Run manually (stop the service first):
 #   SHOW_PREVIEW=1 python main.py      (needs a display; leave unset for the service)
 
@@ -21,7 +24,6 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from ai_edge_litert.interpreter import Interpreter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -64,6 +66,7 @@ signal.signal(signal.SIGINT, _on_sigterm)
 
 
 def log_error(msg):
+    print(msg, file=sys.stderr, flush=True)
     with open(ERROR_LOG, "a") as f:
         f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
 
@@ -127,6 +130,7 @@ class Camera:
 # ---------------- Detector ----------------
 class Detector:
     def __init__(self, path):
+        from ai_edge_litert.interpreter import Interpreter
         self.interp = Interpreter(model_path=path, num_threads=4)
         self.interp.allocate_tensors()
         self.inp = self.interp.get_input_details()[0]
@@ -212,9 +216,12 @@ class Tracker:
 
 
 # ---------------- Main ----------------
-def draw_preview(frame, state, accepts, rejects):
+def draw_preview(frame, state, accepts, rejects, no_model):
     view = frame.copy()
-    cv2.putText(view, f"{state}  A:{accepts} R:{rejects}", (10, 25),
+    label = f"{state}  A:{accepts} R:{rejects}"
+    if no_model:
+        label += "  [NO MODEL]"
+    cv2.putText(view, label, (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
     cv2.imshow("Cacao Sorter", view)
     return cv2.waitKey(1) & 0xFF != ord("q")
@@ -224,26 +231,45 @@ def main():
     global _running
     camera = None
     try:
-        lcd_show_ok = False
+        lcd_ok = False
         try:
             setup_lcd()
-            lcd_show_ok = True
+            lcd_ok = True
         except Exception as e:
             log_error(f"LCD init failed: {e}")      # run without LCD rather than not at all
-        step = lambda a, b="": lcd_show(a, b) if lcd_show_ok else None
+        step = lambda a, b="": lcd_show(a, b) if lcd_ok else None
 
         step("Booting...")
         setup_buttons()
         setup_motors()
         setup_rejector()
+
+        # Try to load the model — not fatal if missing
+        detector = None
         step("Loading Model")
-        detector = Detector(MODEL_PATH)
+        if not os.path.exists(MODEL_PATH):
+            log_error(f"[WARN] Model not found: {MODEL_PATH} — running without detection")
+            step("No model found", "belt test only")
+            time.sleep(2.0)
+        else:
+            try:
+                detector = Detector(MODEL_PATH)
+                print("[INFO] Model loaded OK", flush=True)
+            except Exception as e:
+                log_error(f"[WARN] Model load failed: {e} — running without detection")
+                step("Model load fail", "belt test only")
+                time.sleep(2.0)
+
         step("Init Camera")
         camera = Camera()
         step("Calibrating...")
         time.sleep(1.0)
-        step("System Ready")
+        if detector is None:
+            step("System Ready", "No detection")
+        else:
+            step("System Ready")
         time.sleep(0.5)
+
     except Exception:
         log_error(traceback.format_exc())
         try:
@@ -264,6 +290,7 @@ def main():
     run_end = settle_end = 0.0
     last_id = 0
     last_lcd = 0.0
+    no_model = detector is None
 
     try:
         while _running:
@@ -295,15 +322,16 @@ def main():
             if state == "STOPPING" and now >= settle_end and pending_kicks() == 0:
                 state = "IDLE"
 
-            # ---- detection ----
+            # ---- detection (skipped when no model) ----
             if state in ("RUNNING", "STOPPING") and frame is not None and fid != last_id:
                 last_id = fid
-                for c in tracker.update(detector.detect(frame)):
-                    if c == REJECT_CLASS:
-                        rejects += 1
-                        schedule_kick(KICK_DELAY_SEC)
-                    else:
-                        accepts += 1
+                if detector is not None:
+                    for c in tracker.update(detector.detect(frame)):
+                        if c == REJECT_CLASS:
+                            rejects += 1
+                            schedule_kick(KICK_DELAY_SEC)
+                        else:
+                            accepts += 1
             else:
                 time.sleep(0.01)
 
@@ -311,16 +339,22 @@ def main():
             if now - last_lcd >= 0.25:
                 last_lcd = now
                 if state == "IDLE":
-                    lcd_show(done_text, "Press Start")
+                    line2 = "Press Start" if not no_model else "No detection"
+                    lcd_show(done_text, line2)
                 elif state == "RUNNING":
                     left = max(0, int(run_end - now))
-                    lcd_show(f"Time left {left // 60:02d}:{left % 60:02d}",
-                             f"A:{accepts} R:{rejects} F:{camera.fps:.0f}")
+                    if no_model:
+                        lcd_show(f"Time {left // 60:02d}:{left % 60:02d}",
+                                 f"F:{camera.fps:.0f} no model")
+                    else:
+                        lcd_show(f"Time left {left // 60:02d}:{left % 60:02d}",
+                                 f"A:{accepts} R:{rejects} F:{camera.fps:.0f}")
                 else:
-                    lcd_show("Stopping belt", f"A:{accepts} R:{rejects}")
+                    lcd_show("Stopping belt",
+                             f"A:{accepts} R:{rejects}" if not no_model else "")
 
             if SHOW_PREVIEW and frame is not None:
-                if not draw_preview(frame, state, accepts, rejects):
+                if not draw_preview(frame, state, accepts, rejects, no_model):
                     break
     except Exception:
         log_error(traceback.format_exc())
@@ -333,7 +367,8 @@ def main():
         camera.release()
         if SHOW_PREVIEW:
             cv2.destroyAllWindows()
-        lcd_clear()
+        if lcd_ok:
+            lcd_clear()
         cleanup_buttons()
 
 
