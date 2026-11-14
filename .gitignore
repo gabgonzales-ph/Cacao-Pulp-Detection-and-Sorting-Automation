@@ -1,0 +1,12 @@
+venv313/
+capture/
+capture_cacao/
+archive/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+error.log
+*.log
+runs/
+*.zip
