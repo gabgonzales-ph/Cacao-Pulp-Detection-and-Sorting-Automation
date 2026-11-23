@@ -10,8 +10,8 @@ import time
 import RPi.GPIO as GPIO
 
 SERVO_PIN = 12
-REST_ANGLE = 0      # arm clear of the belt
-KICK_ANGLE = 90     # arm pushed across the belt
+REST_ANGLE = 90     # arm clear of the belt
+KICK_ANGLE = 0      # arm pushed across the belt
 MOVE_SEC = 0.20     # time allowed for the arm to travel
 HOLD_SEC = 0.15     # time held at the kick position
 

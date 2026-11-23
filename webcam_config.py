@@ -1,4 +1,3 @@
-
 # webcam_config.py
 # Settings for the new USB webcam: Sonix "Webcam: Webcam" (usb-0000:01:00.0-1.3).
 # Every value below is a starting point taken from THIS camera's own defaults
